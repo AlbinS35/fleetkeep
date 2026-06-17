@@ -13,11 +13,12 @@ function MainLayoutContainer() {
   });
   const [authMode, setAuthMode] = useState('login');
 
+  // Reset to landing page on logout
   useEffect(() => {
-    if (!user && !hasSeenLanding) {
-      localStorage.setItem('fleetkeep_seen_landing', 'true');
+    if (!user) {
+      setHasSeenLanding(false);
     }
-  }, [user, hasSeenLanding]);
+  }, [user]);
 
   if (user) {
     return <Dashboard />;
@@ -38,7 +39,7 @@ function MainLayoutContainer() {
     );
   }
 
-  return <AuthGate initialMode={authMode} />;
+  return <AuthGate initialMode={authMode} onBack={() => setHasSeenLanding(false)} />;
 }
 
 export default function App() {

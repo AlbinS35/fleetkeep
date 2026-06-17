@@ -67,7 +67,6 @@ def init_db():
     ensure_column(cursor, 'vehicles', 'model_year', 'INTEGER NOT NULL DEFAULT 0')
     ensure_column(cursor, 'vehicles', 'fuel_type', "TEXT NOT NULL DEFAULT 'ICE'")
     ensure_column(cursor, 'vehicles', 'rc_expiry', "TEXT NOT NULL DEFAULT ''")
-    ensure_column(cursor, 'vehicles', 'tax_expiry', "TEXT NOT NULL DEFAULT ''")
     ensure_column(cursor, 'vehicles', 'insurance_expiry', "TEXT NOT NULL DEFAULT ''")
     ensure_column(cursor, 'vehicles', 'fitness_expiry', "TEXT NOT NULL DEFAULT ''")
     ensure_column(cursor, 'vehicles', 'pollution_expiry', 'TEXT')
@@ -125,6 +124,54 @@ def login():
     finally:
         conn.close() # CRITICAL: Release lock after reading data
 
+# ================= USER PROFILE UPDATE =================
+
+@app.route('/api/users/<int:id>', methods=['PUT'])
+def update_user(id):
+    data = request.json
+    username = data.get('username', '').strip().lower()
+    password = data.get('password', '')
+
+    if len(username) < 3:
+        return jsonify({"error": "Username must be at least 3 characters."}), 400
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+
+        # Verify user exists
+        cursor.execute("SELECT * FROM users WHERE id = ?", (id,))
+        user = cursor.fetchone()
+        if not user:
+            return jsonify({"error": "User not found."}), 404
+
+        # Check username uniqueness if changed
+        if username != user['username']:
+            cursor.execute("SELECT id FROM users WHERE username = ? AND id != ?", (username, id))
+            if cursor.fetchone():
+                return jsonify({"error": "Username already taken."}), 400
+
+        # Update username
+        cursor.execute("UPDATE users SET username = ? WHERE id = ?", (username, id))
+
+        # Update password only if provided
+        if password:
+            if len(password) < 6:
+                return jsonify({"error": "Password must be at least 6 characters."}), 400
+            hashed = generate_password_hash(password)
+            cursor.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hashed, id))
+
+        conn.commit()
+
+        return jsonify({
+            "message": "Profile updated successfully.",
+            "user": {"id": id, "username": username}
+        }), 200
+    except Exception as e:
+        return jsonify({"error": f"Update failed: {str(e)}"}), 500
+    finally:
+        conn.close()
+
 # ================= SECURE VEHICLE CRUD ROUTES =================
 
 @app.route('/api/vehicles', methods=['GET'])
@@ -151,7 +198,6 @@ def add_vehicle():
     odometer = data.get('odometer')
     next_service_odo = data.get('next_service_odo')
     rc_expiry = data.get('rc_expiry', '').strip()
-    tax_expiry = data.get('tax_expiry', '').strip()
     insurance_expiry = data.get('insurance_expiry', '').strip()
     fitness_expiry = data.get('fitness_expiry', '').strip()
     pollution_expiry = data.get('pollution_expiry', '').strip()
@@ -165,7 +211,7 @@ def add_vehicle():
         return jsonify({"error": "Next service target must exceed current odometer reading."}), 400
     if fuel_type not in {"ICE", "EV"}:
         return jsonify({"error": "Fuel type must be ICE or EV."}), 400
-    for expiry_value in [rc_expiry, tax_expiry, insurance_expiry, fitness_expiry]:
+    for expiry_value in [rc_expiry, insurance_expiry, fitness_expiry]:
         if not is_valid_iso_date(expiry_value):
             return jsonify({"error": "Document expiry dates must use YYYY-MM-DD format."}), 400
     if fuel_type == 'ICE' and not pollution_expiry:
@@ -187,13 +233,13 @@ def add_vehicle():
             """
             INSERT INTO vehicles (
                 user_id, name, reg_number, brand, model_year, fuel_type,
-                odometer, next_service_odo, rc_expiry, tax_expiry,
+                odometer, next_service_odo, rc_expiry,
                 insurance_expiry, fitness_expiry, pollution_expiry
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id, name, reg_number, brand, int(model_year), fuel_type,
-                odometer, next_service_odo, rc_expiry, tax_expiry,
+                odometer, next_service_odo, rc_expiry,
                 insurance_expiry, fitness_expiry, pollution_expiry
             )
         )
@@ -212,7 +258,6 @@ def update_vehicle(id):
     odometer = data.get('odometer')
     next_service_odo = data.get('next_service_odo')
     rc_expiry = data.get('rc_expiry', '').strip()
-    tax_expiry = data.get('tax_expiry', '').strip()
     insurance_expiry = data.get('insurance_expiry', '').strip()
     fitness_expiry = data.get('fitness_expiry', '').strip()
     pollution_expiry = data.get('pollution_expiry', '').strip()
@@ -225,7 +270,7 @@ def update_vehicle(id):
         return jsonify({"error": "Next service target must exceed current odometer reading."}), 400
     if fuel_type not in {"ICE", "EV"}:
         return jsonify({"error": "Fuel type must be ICE or EV."}), 400
-    for expiry_value in [rc_expiry, tax_expiry, insurance_expiry, fitness_expiry]:
+    for expiry_value in [rc_expiry, insurance_expiry, fitness_expiry]:
         if not is_valid_iso_date(expiry_value):
             return jsonify({"error": "Document expiry dates must use YYYY-MM-DD format."}), 400
     if fuel_type == 'ICE' and not pollution_expiry:
@@ -245,13 +290,13 @@ def update_vehicle(id):
             """
             UPDATE vehicles
             SET name = ?, reg_number = ?, brand = ?, model_year = ?, fuel_type = ?,
-                odometer = ?, next_service_odo = ?, rc_expiry = ?, tax_expiry = ?,
+                odometer = ?, next_service_odo = ?, rc_expiry = ?,
                 insurance_expiry = ?, fitness_expiry = ?, pollution_expiry = ?
             WHERE id = ? AND user_id = ?
             """,
             (
                 name, reg_number, brand, int(model_year), fuel_type,
-                odometer, next_service_odo, rc_expiry, tax_expiry,
+                odometer, next_service_odo, rc_expiry,
                 insurance_expiry, fitness_expiry, pollution_expiry, id, user_id
             )
         )
