@@ -32,10 +32,22 @@ def is_valid_iso_date(value):
     except ValueError:
         return False
 
+# Normalize legacy 'ICE' fuel_type to 'PETROL' for backward compatibility
+def normalize_fuel_type(fuel_type):
+    if not fuel_type:
+        return 'PETROL'
+    ft = fuel_type.strip().upper()
+    if ft == 'ICE':
+        return 'PETROL'
+    return ft
+
+VALID_FUEL_TYPES = {"PETROL", "DIESEL", "EV"}
+VALID_VEHICLE_TYPES = {"CAR", "MOTORBIKE", "SCOOTER", "TRUCK", "BUS", "RICKSHAW"}
+
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
-    # 1. New Users Table
+    # 1. Users Table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,7 +55,7 @@ def init_db():
             password_hash TEXT NOT NULL
         )
     ''')
-    # 2. Updated Vehicles Table linked to a specific user ID
+    # 2. Vehicles Table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS vehicles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,9 +64,13 @@ def init_db():
             reg_number TEXT NOT NULL,
             brand TEXT NOT NULL DEFAULT '',
             model_year INTEGER NOT NULL DEFAULT 0,
-            fuel_type TEXT NOT NULL DEFAULT 'ICE',
+            fuel_type TEXT NOT NULL DEFAULT 'PETROL',
+            vehicle_type TEXT NOT NULL DEFAULT 'CAR',
             odometer INTEGER NOT NULL,
             next_service_odo INTEGER NOT NULL,
+            service_method TEXT NOT NULL DEFAULT 'km',
+            service_period_months INTEGER,
+            last_service_date TEXT,
             rc_expiry TEXT NOT NULL DEFAULT '',
             tax_expiry TEXT NOT NULL DEFAULT '',
             insurance_expiry TEXT NOT NULL DEFAULT '',
@@ -63,13 +79,18 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     ''')
+    # Ensure all columns exist (for existing databases)
     ensure_column(cursor, 'vehicles', 'brand', "TEXT NOT NULL DEFAULT ''")
     ensure_column(cursor, 'vehicles', 'model_year', 'INTEGER NOT NULL DEFAULT 0')
-    ensure_column(cursor, 'vehicles', 'fuel_type', "TEXT NOT NULL DEFAULT 'ICE'")
+    ensure_column(cursor, 'vehicles', 'fuel_type', "TEXT NOT NULL DEFAULT 'PETROL'")
+    ensure_column(cursor, 'vehicles', 'vehicle_type', "TEXT NOT NULL DEFAULT 'CAR'")
     ensure_column(cursor, 'vehicles', 'rc_expiry', "TEXT NOT NULL DEFAULT ''")
     ensure_column(cursor, 'vehicles', 'insurance_expiry', "TEXT NOT NULL DEFAULT ''")
     ensure_column(cursor, 'vehicles', 'fitness_expiry', "TEXT NOT NULL DEFAULT ''")
     ensure_column(cursor, 'vehicles', 'pollution_expiry', 'TEXT')
+    ensure_column(cursor, 'vehicles', 'service_method', "TEXT NOT NULL DEFAULT 'km'")
+    ensure_column(cursor, 'vehicles', 'service_period_months', 'INTEGER')
+    ensure_column(cursor, 'vehicles', 'last_service_date', 'TEXT')
     conn.commit()
     conn.close()
 
@@ -94,14 +115,14 @@ def register():
     try:
         cursor = conn.cursor()
         cursor.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, hashed_password))
-        conn.commit() # Explicitly save the record
+        conn.commit()
         return jsonify({"message": "User registered successfully!"}), 201
     except sqlite3.IntegrityError:
         return jsonify({"error": "Username already taken."}), 400
     except Exception as e:
         return jsonify({"error": f"Database failure: {str(e)}"}), 500
     finally:
-        conn.close() # CRITICAL: This explicitly frees up the database lock!
+        conn.close()
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -122,7 +143,7 @@ def login():
             }), 200
         return jsonify({"error": "Invalid username or password."}), 401
     finally:
-        conn.close() # CRITICAL: Release lock after reading data
+        conn.close()
 
 # ================= USER PROFILE UPDATE =================
 
@@ -139,22 +160,18 @@ def update_user(id):
     try:
         cursor = conn.cursor()
 
-        # Verify user exists
         cursor.execute("SELECT * FROM users WHERE id = ?", (id,))
         user = cursor.fetchone()
         if not user:
             return jsonify({"error": "User not found."}), 404
 
-        # Check username uniqueness if changed
         if username != user['username']:
             cursor.execute("SELECT id FROM users WHERE username = ? AND id != ?", (username, id))
             if cursor.fetchone():
                 return jsonify({"error": "Username already taken."}), 400
 
-        # Update username
         cursor.execute("UPDATE users SET username = ? WHERE id = ?", (username, id))
 
-        # Update password only if provided
         if password:
             if len(password) < 6:
                 return jsonify({"error": "Password must be at least 6 characters."}), 400
@@ -176,7 +193,7 @@ def update_user(id):
 
 @app.route('/api/vehicles', methods=['GET'])
 def get_vehicles():
-    user_id = request.args.get('user_id') # Filter data by who is logged in!
+    user_id = request.args.get('user_id')
     if not user_id:
         return jsonify({"error": "Unauthorized view access."}), 401
 
@@ -184,7 +201,15 @@ def get_vehicles():
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM vehicles WHERE user_id = ?", (user_id,))
         rows = cursor.fetchall()
-    return jsonify([dict(row) for row in rows])
+    
+    result = []
+    for row in rows:
+        v = dict(row)
+        # Normalize legacy ICE fuel type
+        if v.get('fuel_type', '').upper() == 'ICE':
+            v['fuel_type'] = 'PETROL'
+        result.append(v)
+    return jsonify(result)
 
 @app.route('/api/vehicles', methods=['POST'])
 def add_vehicle():
@@ -194,28 +219,41 @@ def add_vehicle():
     reg_number = data.get('reg_number', '').strip().upper()
     brand = data.get('brand', '').strip()
     model_year = data.get('model_year')
-    fuel_type = data.get('fuel_type', 'ICE').strip().upper()
+    fuel_type = normalize_fuel_type(data.get('fuel_type', 'PETROL'))
+    vehicle_type = data.get('vehicle_type', 'CAR').strip().upper()
     odometer = data.get('odometer')
     next_service_odo = data.get('next_service_odo')
+    service_method = data.get('service_method', 'km').strip().lower()
+    service_period_months = data.get('service_period_months')
+    last_service_date = data.get('last_service_date', '').strip() or None
     rc_expiry = data.get('rc_expiry', '').strip()
     insurance_expiry = data.get('insurance_expiry', '').strip()
     fitness_expiry = data.get('fitness_expiry', '').strip()
     pollution_expiry = data.get('pollution_expiry', '').strip()
 
-    # Data Type and Content Validation
     if not user_id or not name or not brand or not reg_number:
         return jsonify({"error": "Missing essential fields."}), 400
     if not model_year or int(model_year) < 1900:
         return jsonify({"error": "Model year must be a valid year."}), 400
+    if fuel_type not in VALID_FUEL_TYPES:
+        return jsonify({"error": "Fuel type must be Petrol, Diesel, or EV."}), 400
+    if vehicle_type not in VALID_VEHICLE_TYPES:
+        return jsonify({"error": "Invalid vehicle type."}), 400
+
+    # Service validation — always validate km fields; validate time fields only if both are provided
     if int(odometer) < 0 or int(next_service_odo) <= int(odometer):
         return jsonify({"error": "Next service target must exceed current odometer reading."}), 400
-    if fuel_type not in {"ICE", "EV"}:
-        return jsonify({"error": "Fuel type must be ICE or EV."}), 400
+    if service_period_months or last_service_date:
+        if not service_period_months or int(service_period_months) < 1:
+            return jsonify({"error": "Service period months must be at least 1 when time-based tracking is enabled."}), 400
+        if not last_service_date or not is_valid_iso_date(last_service_date):
+            return jsonify({"error": "Last service date is required when time-based tracking is enabled."}), 400
+
     for expiry_value in [rc_expiry, insurance_expiry, fitness_expiry]:
         if not is_valid_iso_date(expiry_value):
             return jsonify({"error": "Document expiry dates must use YYYY-MM-DD format."}), 400
-    if fuel_type == 'ICE' and not pollution_expiry:
-        return jsonify({"error": "Pollution certificate expiry is required for ICE vehicles."}), 400
+    if fuel_type in ('PETROL', 'DIESEL') and not pollution_expiry:
+        return jsonify({"error": "Pollution certificate expiry is required for Petrol/Diesel vehicles."}), 400
     if fuel_type == 'EV':
         pollution_expiry = None
     elif not is_valid_iso_date(pollution_expiry):
@@ -224,7 +262,6 @@ def add_vehicle():
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        # Check if this user already registered this specific plate sequence
         cursor.execute("SELECT id FROM vehicles WHERE user_id = ? AND reg_number = ?", (user_id, reg_number))
         if cursor.fetchone():
             return jsonify({"error": "This vehicle plate is already in your garage logs."}), 400
@@ -232,15 +269,19 @@ def add_vehicle():
         cursor.execute(
             """
             INSERT INTO vehicles (
-                user_id, name, reg_number, brand, model_year, fuel_type,
-                odometer, next_service_odo, rc_expiry,
-                insurance_expiry, fitness_expiry, pollution_expiry
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                user_id, name, reg_number, brand, model_year, fuel_type, vehicle_type,
+                odometer, next_service_odo, service_method, service_period_months, last_service_date,
+                rc_expiry, insurance_expiry, fitness_expiry, pollution_expiry
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                user_id, name, reg_number, brand, int(model_year), fuel_type,
-                odometer, next_service_odo, rc_expiry,
-                insurance_expiry, fitness_expiry, pollution_expiry
+                user_id, name, reg_number, brand, int(model_year), fuel_type, vehicle_type,
+                int(odometer) if odometer is not None else 0,
+                int(next_service_odo) if next_service_odo is not None else 0,
+                service_method,
+                int(service_period_months) if service_period_months else None,
+                last_service_date,
+                rc_expiry, insurance_expiry, fitness_expiry, pollution_expiry
             )
         )
     return jsonify({"message": "Vehicle logged successfully!"}), 201
@@ -254,9 +295,13 @@ def update_vehicle(id):
     reg_number = data.get('reg_number', '').strip().upper()
     brand = data.get('brand', '').strip()
     model_year = data.get('model_year')
-    fuel_type = data.get('fuel_type', 'ICE').strip().upper()
+    fuel_type = normalize_fuel_type(data.get('fuel_type', 'PETROL'))
+    vehicle_type = data.get('vehicle_type', 'CAR').strip().upper()
     odometer = data.get('odometer')
     next_service_odo = data.get('next_service_odo')
+    service_method = data.get('service_method', 'km').strip().lower()
+    service_period_months = data.get('service_period_months')
+    last_service_date = data.get('last_service_date', '').strip() or None
     rc_expiry = data.get('rc_expiry', '').strip()
     insurance_expiry = data.get('insurance_expiry', '').strip()
     fitness_expiry = data.get('fitness_expiry', '').strip()
@@ -266,15 +311,25 @@ def update_vehicle(id):
         return jsonify({"error": "Missing essential fields."}), 400
     if not model_year or int(model_year) < 1900:
         return jsonify({"error": "Model year must be a valid year."}), 400
-    if int(odometer) < 0 or int(next_service_odo) <= int(odometer):
-        return jsonify({"error": "Next service target must exceed current odometer reading."}), 400
-    if fuel_type not in {"ICE", "EV"}:
-        return jsonify({"error": "Fuel type must be ICE or EV."}), 400
+    if fuel_type not in VALID_FUEL_TYPES:
+        return jsonify({"error": "Fuel type must be Petrol, Diesel, or EV."}), 400
+    if vehicle_type not in VALID_VEHICLE_TYPES:
+        return jsonify({"error": "Invalid vehicle type."}), 400
+
+    if service_method == 'km':
+        if int(odometer) < 0 or int(next_service_odo) <= int(odometer):
+            return jsonify({"error": "Next service target must exceed current odometer reading."}), 400
+    else:
+        if not service_period_months or int(service_period_months) < 1:
+            return jsonify({"error": "Service period months must be at least 1."}), 400
+        if not last_service_date or not is_valid_iso_date(last_service_date):
+            return jsonify({"error": "Last service date is required for time-based service."}), 400
+
     for expiry_value in [rc_expiry, insurance_expiry, fitness_expiry]:
         if not is_valid_iso_date(expiry_value):
             return jsonify({"error": "Document expiry dates must use YYYY-MM-DD format."}), 400
-    if fuel_type == 'ICE' and not pollution_expiry:
-        return jsonify({"error": "Pollution certificate expiry is required for ICE vehicles."}), 400
+    if fuel_type in ('PETROL', 'DIESEL') and not pollution_expiry:
+        return jsonify({"error": "Pollution certificate expiry is required for Petrol/Diesel vehicles."}), 400
     if fuel_type == 'EV':
         pollution_expiry = None
     elif not is_valid_iso_date(pollution_expiry):
@@ -289,26 +344,33 @@ def update_vehicle(id):
         cursor.execute(
             """
             UPDATE vehicles
-            SET name = ?, reg_number = ?, brand = ?, model_year = ?, fuel_type = ?,
-                odometer = ?, next_service_odo = ?, rc_expiry = ?,
-                insurance_expiry = ?, fitness_expiry = ?, pollution_expiry = ?
+            SET name = ?, reg_number = ?, brand = ?, model_year = ?, fuel_type = ?, vehicle_type = ?,
+                odometer = ?, next_service_odo = ?, service_method = ?, service_period_months = ?,
+                last_service_date = ?, rc_expiry = ?, insurance_expiry = ?, fitness_expiry = ?, pollution_expiry = ?
             WHERE id = ? AND user_id = ?
             """,
             (
-                name, reg_number, brand, int(model_year), fuel_type,
-                odometer, next_service_odo, rc_expiry,
-                insurance_expiry, fitness_expiry, pollution_expiry, id, user_id
+                name, reg_number, brand, int(model_year), fuel_type, vehicle_type,
+                int(odometer) if odometer is not None else 0,
+                int(next_service_odo) if next_service_odo is not None else 0,
+                service_method,
+                int(service_period_months) if service_period_months else None,
+                last_service_date,
+                rc_expiry, insurance_expiry, fitness_expiry, pollution_expiry,
+                id, user_id
             )
         )
 
         cursor.execute("SELECT * FROM vehicles WHERE id = ? AND user_id = ?", (id, user_id))
         vehicle = cursor.fetchone()
+        v = dict(vehicle)
+        if v.get('fuel_type', '').upper() == 'ICE':
+            v['fuel_type'] = 'PETROL'
 
-    return jsonify({"message": "Vehicle updated successfully.", "vehicle": dict(vehicle)}), 200
+    return jsonify({"message": "Vehicle updated successfully.", "vehicle": v}), 200
 
 @app.route('/api/vehicles/<int:id>', methods=['DELETE'])
 def delete_vehicle(id):
-    # Basic Security Check: Verify user owns the asset before deleting
     user_id = request.args.get('user_id')
     
     with get_db_connection() as conn:

@@ -1,5 +1,22 @@
 import { useEffect, useState } from 'react';
-import { useGarage } from '../context/GarageContext';
+import { useDispatch, useSelector } from 'react-redux';
+import {
+  fetchVehicleAssets,
+  commitAssetToLedger,
+  patchAssetRecord,
+  decommissionAsset,
+  setFleetFilter as setReduxFleetFilter,
+  setActiveEditId,
+  clearActiveEdit,
+  selectFilteredAssets,
+} from '../../store/vehicleSlice';
+import {
+  logoutUser as logoutReduxUser,
+  updateUserProfile as updateReduxUserProfile,
+  selectUser,
+  selectAuthStatus,
+  selectAuthError,
+} from '../../store/authSlice';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -166,7 +183,18 @@ const fuelBadgeColor = (ft) => {
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function Dashboard() {
-  const { user, vehicles, error, loading, logoutUser, addVehicle, updateUserProfile, updateVehicle, decommissionVehicle } = useGarage();
+  const dispatch = useDispatch();
+  const user = useSelector(selectUser);
+  const vehicles = useSelector((state) => state.vehicles.assets);
+  const filteredVehicles = useSelector(selectFilteredAssets);
+  const loading = useSelector((state) => state.vehicles.status === 'loading');
+  const error = useSelector((state) => state.vehicles.error || state.vehicles.operationError);
+
+  const fleetFilter = useSelector((state) => state.vehicles.fleetFilter);
+  const setFleetFilter = (val) => dispatch(setReduxFleetFilter(val));
+
+  const editingVehicleId = useSelector((state) => state.vehicles.activeEditId);
+  const setEditingVehicleId = (id) => dispatch(setActiveEditId(id));
 
   const [profileUsername, setProfileUsername] = useState(user?.username || '');
   const [profilePassword, setProfilePassword] = useState('');
@@ -174,16 +202,18 @@ export default function Dashboard() {
   const [profileError, setProfileError] = useState('');
 
   const [vehicleForm, setVehicleForm] = useState(emptyVehicleForm);
-  const [editingVehicleId, setEditingVehicleId] = useState(null);
   const [localError, setLocalError] = useState('');
   const [showPersonalDetailsPanel, setShowPersonalDetailsPanel] = useState(false);
-
-  // Fleet filter
-  const [fleetFilter, setFleetFilter] = useState('All');
 
   // Mileage Calculator
   const [showCalculator, setShowCalculator] = useState(false);
   const [calc, setCalc] = useState(emptyCostForm);
+
+  useEffect(() => {
+    if (user?.id) {
+      dispatch(fetchVehicleAssets(user.id));
+    }
+  }, [user, dispatch]);
 
   useEffect(() => {
     setProfileUsername(user?.username || '');
@@ -293,16 +323,28 @@ export default function Dashboard() {
     setProfileError(''); setProfileNotice('');
     if (profileUsername.trim().length < 3) { setProfileError('User ID must be at least 3 characters.'); return; }
     if (profilePassword && profilePassword.length < 6) { setProfileError('Password must be at least 6 characters.'); return; }
-    const success = await updateUserProfile({ username: profileUsername.trim(), password: profilePassword });
-    if (success) { setProfilePassword(''); setProfileNotice('Profile updated successfully.'); }
-    else setProfileError('Failed to update profile. Please try again.');
+    
+    const resultAction = await dispatch(updateReduxUserProfile({
+      userId: user.id,
+      profileData: { username: profileUsername.trim(), password: profilePassword }
+    }));
+    
+    if (updateReduxUserProfile.fulfilled.match(resultAction)) {
+      setProfilePassword('');
+      setProfileNotice('Profile updated successfully.');
+    } else {
+      setProfileError(resultAction.payload || 'Failed to update profile. Please try again.');
+    }
   };
 
   // ─── Vehicle form ──────────────────────────────────────────────────────────
 
   const handleVehicleChange = (field, value) => setVehicleForm((prev) => ({ ...prev, [field]: value }));
 
-  const clearVehicleForm = () => { setVehicleForm(emptyVehicleForm); setEditingVehicleId(null); };
+  const clearVehicleForm = () => {
+    setVehicleForm(emptyVehicleForm);
+    dispatch(clearActiveEdit());
+  };
 
   const handleAddOrUpdateVehicle = async (e) => {
     e.preventDefault(); setLocalError('');
@@ -347,36 +389,34 @@ export default function Dashboard() {
       pollution_expiry: vehicleForm.fuel_type === 'EV' ? '' : vehicleForm.pollution_expiry
     };
 
-    const success = editingVehicleId ? await updateVehicle(editingVehicleId, payload) : await addVehicle(payload);
-    if (success) clearVehicleForm();
+    const action = editingVehicleId
+      ? patchAssetRecord({ userId: user.id, vehicleId: editingVehicleId, vehicleData: payload })
+      : commitAssetToLedger({ userId: user.id, vehicleData: payload });
+
+    const resultAction = await dispatch(action);
+    if (commitAssetToLedger.fulfilled.match(resultAction) || patchAssetRecord.fulfilled.match(resultAction)) {
+      clearVehicleForm();
+      dispatch(fetchVehicleAssets(user.id));
+    } else {
+      setLocalError(resultAction.payload || 'Operation failed.');
+    }
   };
 
   // ─── Styles ────────────────────────────────────────────────────────────────
-
   const inputStyle = { width: '100%', padding: '12px 14px', backgroundColor: '#020617', border: '1px solid rgba(148,163,184,0.18)', borderRadius: '14px', color: '#f8fafc', boxSizing: 'border-box', fontFamily: 'inherit', fontSize: '14px' };
   const labelStyle = { fontSize: '12px', color: '#94a3b8', letterSpacing: '0.08em', textTransform: 'uppercase' };
   const sectionCard = { backgroundColor: 'rgba(15,23,42,0.82)', padding: '24px', borderRadius: '22px', border: '1px solid rgba(148,163,184,0.16)', boxShadow: '0 24px 60px rgba(0,0,0,0.22)' };
 
-  // ─── Filtered fleet ───────────────────────────────────────────────────────
-
-  const filteredVehicles = fleetFilter === 'All'
-    ? vehicles
-    : vehicles.filter(v => normalizeVehicleType(v.vehicle_type) === fleetFilter);
-
   // ─── Recommended interval for current form vehicle type ───────────────────
-
   const recommendedInterval = SERVICE_INTERVALS[vehicleForm.vehicle_type] || SERVICE_INTERVALS['Car'];
 
   // ─── Urgency styling helpers ───────────────────────────────────────────────
-
   const urgencyStyle = (level) => {
     if (level >= 3) return { bg: 'rgba(127,29,29,0.55)',  border: 'rgba(248,113,113,0.4)', color: '#fca5a5',  label: 'OVERDUE'  };
     if (level === 2) return { bg: 'rgba(120,53,15,0.55)',  border: 'rgba(251,146,60,0.4)',  color: '#fdba74',  label: 'URGENT'   };
     if (level === 1) return { bg: 'rgba(113,63,18,0.35)',  border: 'rgba(245,158,11,0.3)',  color: '#fcd34d',  label: 'DUE SOON' };
     return           { bg: 'rgba(6,78,59,0.4)',            border: 'rgba(52,211,153,0.25)', color: '#6ee7b7',  label: 'OK'       };
   };
-
-  // ═══════════════════════════ RENDER ═══════════════════════════
 
   return (
     <div style={{ minHeight: '100vh', background: 'radial-gradient(circle at top left,rgba(59,130,246,0.14),transparent 30%),radial-gradient(circle at top right,rgba(14,165,233,0.12),transparent 24%),linear-gradient(180deg,#06101d 0%,#0d1727 100%)', color: '#f8fafc', fontFamily: 'Inter,"Segoe UI",sans-serif' }}>
@@ -399,7 +439,7 @@ export default function Dashboard() {
           <span style={{ width: '42px', height: '42px', borderRadius: '14px', display: 'grid', placeItems: 'center', background: 'linear-gradient(135deg,#38bdf8 0%,#2563eb 100%)', color: '#eff6ff', fontWeight: 800 }}>FK</span>
           <div>
             <div style={{ fontSize: '20px', fontWeight: 800, letterSpacing: '-0.03em' }}>FleetKeep</div>
-            <div style={{ color: '#94a3b8', fontSize: '13px' }}>Vehicle records, expiry tracking & multi-fleet management</div>
+            <div style={{ color: '#94a3b8', fontSize: '13px' }}>Vehicle records, expiry tracking &amp; multi-fleet management</div>
           </div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
@@ -412,7 +452,7 @@ export default function Dashboard() {
             <span style={{ width: '32px', height: '32px', borderRadius: '999px', display: 'grid', placeItems: 'center', backgroundColor: '#0f172a', border: '1px solid rgba(148,163,184,0.2)', color: '#93c5fd', fontWeight: 800, fontSize: '14px' }}>{operatorAvatar}</span>
             <strong style={{ color: '#f8fafc' }}>{operatorLabel}</strong>
           </button>
-          <button onClick={logoutUser} style={{ backgroundColor: 'transparent', border: '1px solid rgba(248,113,113,0.35)', color: '#fca5a5', fontWeight: 800, cursor: 'pointer', fontSize: '14px', padding: '10px 16px', borderRadius: '999px', fontFamily: 'inherit' }}>Logout</button>
+          <button onClick={() => dispatch(logoutReduxUser())} style={{ backgroundColor: 'transparent', border: '1px solid rgba(248,113,113,0.35)', color: '#fca5a5', fontWeight: 800, cursor: 'pointer', fontSize: '14px', padding: '10px 16px', borderRadius: '999px', fontFamily: 'inherit' }}>Logout</button>
         </div>
       </nav>
 
@@ -467,7 +507,7 @@ export default function Dashboard() {
                   <input type="text" placeholder="e.g., Honda" value={vehicleForm.brand} onChange={(e) => handleVehicleChange('brand', e.target.value)} style={inputStyle} required />
                 </div>
 
-                {/* Vehicle Name */}
+                {/* Vehicle Name / Model */}
                 <div style={{ display: 'grid', gap: '8px' }}>
                   <label style={labelStyle}>Vehicle Name / Model</label>
                   <input type="text" placeholder="e.g., Unicorn 160" value={vehicleForm.name} onChange={(e) => handleVehicleChange('name', e.target.value)} style={inputStyle} required />
@@ -659,7 +699,7 @@ export default function Dashboard() {
                         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '8px', flexShrink: 0 }}>
                           <div style={{ display: 'flex', gap: '8px' }}>
                             <button onClick={() => setEditingVehicleId(vehicle.id)} style={{ backgroundColor: 'transparent', border: '1px solid rgba(125,211,252,0.3)', color: '#7dd3fc', cursor: 'pointer', fontSize: '13px', padding: '7px 12px', borderRadius: '999px', fontFamily: 'inherit' }}>Edit</button>
-                            <button onClick={() => decommissionVehicle(vehicle.id)} style={{ backgroundColor: 'transparent', border: '1px solid rgba(248,113,113,0.28)', color: '#fca5a5', cursor: 'pointer', fontSize: '13px', padding: '7px 12px', borderRadius: '999px', fontFamily: 'inherit' }}>Remove</button>
+                            <button onClick={() => dispatch(decommissionAsset({ userId: user.id, vehicleId: vehicle.id }))} style={{ backgroundColor: 'transparent', border: '1px solid rgba(248,113,113,0.28)', color: '#fca5a5', cursor: 'pointer', fontSize: '13px', padding: '7px 12px', borderRadius: '999px', fontFamily: 'inherit' }}>Remove</button>
                           </div>
                         </div>
                       </div>
